@@ -1,0 +1,10 @@
+{
+  "type": "unity",
+  "base": null,
+  "tests": ["Assets/**/Tests/**", "Assets/Tests/**"],
+  "vendor": [],
+  "contracts": ["Assets/**/Net/**", "Assets/**/Api/**", "Assets/**/Network/**", "Assets/**/*Dto.cs", "Assets/**/*Request.cs", "Assets/**/*Response.cs"],
+  "hot": ["Assets/**/*Controller.cs", "Assets/**/*System.cs", "Assets/**/*Manager.cs"],
+  "conventions": ["AGENTS.md", "CLAUDE.md", ".editorconfig"],
+  "counterparts": []
+}

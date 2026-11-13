@@ -1,0 +1,9 @@
+{
+  "five_h_pause": 0.80,
+  "week_stop": 0.70,
+  "quiet": [],
+  "run": { "max_usd": null, "max_tokens": null, "max_minutes": null },
+  "self_metered": { "xai": { "five_h_usd": 5.0, "week_usd": 25.0 } },
+  "models": { "finder": null, "refute": null, "thinking": null },
+  "coderabbit": { "per_hour": 3 }
+}

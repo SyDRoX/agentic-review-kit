@@ -1,0 +1,10 @@
+{
+  "type": "ts-worker",
+  "base": null,
+  "tests": ["test/**", "**/*.test.ts", "**/*.spec.ts"],
+  "vendor": [],
+  "contracts": ["src/index.ts", "src/**/routes/**", "src/**/*schema*.ts", "src/**/*validation*.ts", "migrations/**"],
+  "hot": ["src/index.ts"],
+  "conventions": ["AGENTS.md", "CLAUDE.md", "README.md"],
+  "counterparts": []
+}

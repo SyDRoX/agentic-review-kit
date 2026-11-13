@@ -1,0 +1,10 @@
+{
+  "type": "python",
+  "base": null,
+  "tests": ["tests/**", "**/test_*.py", "**/*_test.py"],
+  "vendor": [],
+  "contracts": ["**/routes/**", "**/api/**", "**/schemas/**", "**/models/**", "migrations/**", "alembic/**"],
+  "hot": [],
+  "conventions": ["AGENTS.md", "CLAUDE.md", "README.md", "pyproject.toml"],
+  "counterparts": []
+}

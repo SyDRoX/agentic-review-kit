@@ -1,0 +1,6 @@
+{
+  "targets": [
+    { "repo": "C:/path/to/game", "base": null, "level": "auto", "backend": "pi" },
+    { "repo": "C:/path/to/game-backend", "base": null, "level": "auto", "backend": "both" }
+  ]
+}

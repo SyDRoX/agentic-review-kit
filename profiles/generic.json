@@ -1,0 +1,10 @@
+{
+  "type": "generic",
+  "base": null,
+  "tests": [],
+  "vendor": [],
+  "contracts": [],
+  "hot": [],
+  "conventions": ["AGENTS.md", "CLAUDE.md", "CONTRIBUTING.md", "README.md"],
+  "counterparts": []
+}
