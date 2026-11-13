@@ -88,6 +88,15 @@ function Invoke-Usage {
     $providers = @(@($models | ForEach-Object { Get-ProviderOf $_ }) + @('openai-codex') + @($budget.self_metered.Keys) | Where-Object { $_ } | Select-Object -Unique)
     foreach ($p in $providers) { Write-Host (Format-UsageLine (Get-ProviderUsage -Provider $p -Budget $budget)) }
 
+    if (Get-CursorAuthPath) {
+        $applies = @($budget.cursor.applies_to | Where-Object { $_ })
+        if ($providers -notcontains 'cursor' -and -not ($applies | Where-Object { $providers -contains $_ })) {
+            Write-Host (Format-UsageLine (Get-ProviderUsage -Provider 'cursor' -Budget $budget))
+        }
+        Write-Host $(if ($applies.Count) { "cursor pool: enforced as the quota of $($applies -join ', ') (cursor.applies_to in budget.json)" }
+            else { 'cursor pool: reported only. It is the pool of the Cursor Agent login; set cursor.applies_to in budget.json to enforce it for another provider once you know they share it.' })
+    }
+
     $rabbit = Get-RabbitState -Budget $budget
     Write-Host "coderabbit: $($rabbit.Reason)"
     $week = Get-LedgerSpend -Since (Get-Date).AddDays(-7)

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.0
+
+- `ark usage` reports the subscription pool of the Cursor Agent CLI login: percent used, remaining, period length and reset time.
+- `cursor.applies_to` in budget.json makes that pool the enforced quota of another provider.
+- The gate handles a provider with one billing period and no 5-hour window.
 ## 0.2.0
 
 - `ark audit-plan` and `ark audit`: review the current code by folder chunks instead of by diff. Old defects count; history is not read.

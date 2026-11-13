@@ -341,6 +341,48 @@ Describe 'Limits: budget file, ledger and Codex reply' {
         (ConvertFrom-CodexUsage ('{"plan_type":"plus"}' | ConvertFrom-Json)).Known | Should -BeFalse
     }
 
+    It 'reads the Cursor usage reply as one period with no 5-hour window' {
+        $j = '{"currentPeriodStart":"2026-11-07T15:43:30.516Z","nextResetTimestampUtc":"2026-11-14T15:43:30.516Z","usagePercent":36.85807150595883,"hasAvailableUsage":true,"hasNonZeroIncludedLimit":true,"cursorPlanName":"Premium","isUnified":true,"billingBrand":"SAND_BILLING_BRAND_GROK"}' | ConvertFrom-Json
+        $u = ConvertFrom-CursorUsage $j
+        $u.Known | Should -BeTrue
+        [Math]::Round($u.Week, 4) | Should -Be 0.3686
+        $u.FiveH | Should -BeNullOrEmpty
+        $u.PeriodDays | Should -Be 7
+        $u.Plan | Should -Be 'Premium'
+        $u.LimitReached | Should -BeFalse
+        $u | Add-Member Provider 'cursor'; $u | Add-Member Source 'provider'
+        $line = Format-UsageLine $u
+        $line | Should -Match '36\.9% used, remaining 100 - 36\.9 = 63\.1%'
+        $line | Should -Match '7-day period'
+        $line | Should -Match '5h window not reported'
+    }
+
+    It 'never reads a missing Cursor percentage as zero' {
+        $u = ConvertFrom-CursorUsage ('{"cursorPlanName":"Premium","hasAvailableUsage":true}' | ConvertFrom-Json)
+        $u.Known | Should -BeFalse
+        $u.Error | Should -Match 'usagePercent'
+        (ConvertFrom-CursorUsage ('{"usagePercent":null}' | ConvertFrom-Json)).Known | Should -BeFalse
+    }
+
+    It 'gates a one-period provider on the weekly stop and on exhausted usage, with no 5-hour wait' {
+        $b = Get-Budget
+        $u = [pscustomobject]@{ Known = $true; Provider = 'cursor'; Source = 'provider'; FiveH = $null; Week = 0.37; WeekReset = (Get-Date).AddDays(1); LimitReached = $false }
+        $d = Get-GateDecision -Usage $u -Budget $b
+        $d.Action | Should -Be 'go'
+        $d.Reason | Should -Match '5h window not reported'
+        $u.Week = 0.71
+        (Get-GateDecision -Usage $u -Budget $b).Action | Should -Be 'stop'
+        $u.Week = 0.10; $u.LimitReached = $true
+        (Get-GateDecision -Usage $u -Budget $b).Action | Should -Be 'stop'
+    }
+
+    It 'enforces the Cursor pool for another provider only when the budget file says so' {
+        (Get-Budget).cursor.applies_to.Count | Should -Be 0
+        (Get-ProviderUsage -Provider xai -Budget (Get-Budget)).Source | Should -Be 'ledger'
+        Set-Content (Join-Path $script:Home_ 'budget.json') '{"cursor":{"applies_to":["xai"]}}'
+        @((Get-Budget).cursor.applies_to) | Should -Be @('xai')
+    }
+
     It 'names the provider from the model id' {
         Get-ProviderOf 'openai-codex/gpt-x' | Should -Be 'openai-codex'
         Get-ProviderOf 'grok' | Should -BeNullOrEmpty

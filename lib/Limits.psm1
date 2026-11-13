@@ -17,6 +17,7 @@ $script:Defaults = @{
     self_metered = @{ xai = @{ five_h_usd = 5.0; week_usd = 25.0 } }
     models       = @{ finder = $null; refute = $null; thinking = $null }
     coderabbit   = @{ per_hour = 3 }
+    cursor       = @{ applies_to = @() }
 }
 
 function Get-KitHome {
@@ -146,6 +147,83 @@ function ConvertFrom-CodexUsage {
     }
 }
 
+function Get-CursorAuthPath {
+    <#
+    .SYNOPSIS
+        Where the Cursor Agent CLI keeps its credentials, by the same rule the CLI uses: a per-user config folder named
+        after the product. Returns null when the CLI is not installed or has never logged in.
+    #>
+    [CmdletBinding()]
+    param()
+
+    $installed = (Get-Command agent, cursor-agent -ErrorAction SilentlyContinue | Select-Object -First 1) -or
+        ($env:LOCALAPPDATA -and (Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA 'cursor-agent')))
+    if (-not $installed) { return $null }
+
+    $path = if ($IsWindows) {
+        $roaming = if ($env:APPDATA) { $env:APPDATA } else { Join-Path $HOME 'AppData/Roaming' }
+        Join-Path $roaming 'Cursor/auth.json'
+    }
+    elseif ($IsMacOS) { Join-Path $HOME '.cursor/auth.json' }
+    else { Join-Path $(if ($env:XDG_CONFIG_HOME) { $env:XDG_CONFIG_HOME } else { Join-Path $HOME '.config' }) 'cursor/auth.json' }
+    if (Test-Path -LiteralPath $path -PathType Leaf) { return $path }
+    return $null
+}
+
+function ConvertFrom-CursorUsage {
+    <#
+    .SYNOPSIS
+        Reads a GetSandUsageStatus reply. One billing period, no 5-hour window. A field the reply does not carry stays
+        unknown: a missing percentage is never read as zero.
+    #>
+    param([Parameter(Mandatory)] $Json)
+
+    $has = { param($n) $Json.PSObject.Properties.Name -contains $n }
+    if (-not (& $has 'usagePercent') -or $null -eq $Json.usagePercent) {
+        return [pscustomobject]@{ Known = $false; Error = 'the reply carries no usagePercent' }
+    }
+    $when = { param($n) if ((& $has $n) -and $Json.$n) { ([datetimeoffset] $Json.$n).LocalDateTime } else { $null } }
+    $start = & $when 'currentPeriodStart'
+    $reset = & $when 'nextResetTimestampUtc'
+    return [pscustomobject]@{
+        Known = $true; Error = $null
+        Plan = $(if (& $has 'cursorPlanName') { [string] $Json.cursorPlanName } else { $null })
+        Brand = $(if (& $has 'billingBrand') { [string] $Json.billingBrand } else { $null })
+        Unified = $(if (& $has 'isUnified') { [bool] $Json.isUnified } else { $null })
+        FiveH = $null; FiveHReset = $null
+        Week = [double] $Json.usagePercent / 100; WeekReset = $reset; PeriodStart = $start
+        PeriodDays = $(if ($start -and $reset) { [Math]::Round(($reset - $start).TotalDays, 1) } else { $null })
+        LimitReached = $(if (& $has 'hasAvailableUsage') { -not [bool] $Json.hasAvailableUsage } else { $false })
+    }
+}
+
+function Get-CursorUsage {
+    <#
+    .SYNOPSIS
+        Use of the subscription pool the Cursor Agent CLI is logged in to, from the usage call the CLI itself makes.
+        The call is not a documented interface and can change with any CLI release. It runs no model.
+        The token is read into memory and sent only to api2.cursor.sh. A rejected token is reported, never refreshed.
+    #>
+    [CmdletBinding()]
+    param()
+
+    $path = Get-CursorAuthPath
+    if (-not $path) { return [pscustomobject]@{ Known = $false; Error = 'Cursor Agent CLI is not installed or not logged in' } }
+    try {
+        $token = (Get-Content -LiteralPath $path -Raw | ConvertFrom-Json).accessToken
+        if (-not $token) { return [pscustomobject]@{ Known = $false; Error = 'no access token in the Cursor credential file' } }
+        $headers = @{ Authorization = "Bearer $token"; 'Connect-Protocol-Version' = '1' }
+        $j = Invoke-RestMethod -Method Post -Uri 'https://api2.cursor.sh/aiserver.v1.DashboardService/GetSandUsageStatus' -Headers $headers `
+            -ContentType 'application/json' -Body '{}' -TimeoutSec 20
+        return ConvertFrom-CursorUsage $j
+    }
+    catch {
+        $status = $_.Exception.Response.StatusCode.value__
+        $why = if ($status -in 401, 403) { "the Cursor login was rejected ($status); log in again with the Cursor Agent CLI" } else { "usage call failed: $($_.Exception.Message)" }
+        return [pscustomobject]@{ Known = $false; Error = $why }
+    }
+}
+
 function Get-ProviderUsage {
     <#
     .SYNOPSIS
@@ -158,6 +236,16 @@ function Get-ProviderUsage {
     if ($Provider -eq 'openai-codex') {
         $u = Get-CodexUsage
         $u | Add-Member -NotePropertyName Provider -NotePropertyValue $Provider
+        $u | Add-Member -NotePropertyName Source -NotePropertyValue 'provider'
+        return $u
+    }
+
+    # The Cursor pool is a quota for another route only when the budget file says so: the kit cannot prove that
+    # two logins draw on one allowance.
+    $viaCursor = $Provider -and $Provider -ne 'cursor' -and (@($Budget.cursor.applies_to) -contains $Provider)
+    if ($Provider -eq 'cursor' -or $viaCursor) {
+        $u = Get-CursorUsage
+        $u | Add-Member -NotePropertyName Provider -NotePropertyValue $(if ($viaCursor) { "$Provider (Cursor pool)" } else { 'cursor' })
         $u | Add-Member -NotePropertyName Source -NotePropertyValue 'provider'
         return $u
     }
@@ -203,6 +291,11 @@ function Get-GateDecision {
     if ($Usage.Known) {
         if ($Usage.Week -ge $Budget.week_stop) {
             return & $decide 'stop' ('weekly use {0:P0} is at the {1:P0} stop; resets {2:ddd HH:mm}' -f $Usage.Week, $Budget.week_stop, $Usage.WeekReset) $null
+        }
+        # A provider with one period and no 5-hour window: nothing to wait for inside the period.
+        if ($null -eq $Usage.FiveH) {
+            if ($Usage.LimitReached) { return & $decide 'stop' ('{0}: the provider reports no usage left; resets {1:ddd HH:mm}' -f $Usage.Provider, $Usage.WeekReset) $null }
+            return & $decide 'go' ('period {0:P0} used; 5h window not reported by {1}' -f $Usage.Week, $Usage.Provider) $null
         }
         if ($Usage.LimitReached -or $Usage.FiveH -ge $Budget.five_h_pause) {
             $until = if ($Usage.FiveHReset) { $Usage.FiveHReset.AddMinutes(2) } else { $Now.AddMinutes(30) }
@@ -257,6 +350,12 @@ function Wait-LimitGate {
 function Format-UsageLine {
     param([Parameter(Mandatory)] $Usage)
 
+    if ($Usage.Known -and $null -eq $Usage.FiveH) {
+        $used = [Math]::Round($Usage.Week * 100, 1)
+        $period = if ($Usage.PeriodDays) { "$($Usage.PeriodDays)-day period" } else { 'period of unreported length' }
+        return ('{0} ({1}, {2}): {3}% used, remaining 100 - {3} = {4}%; {5} resets {6:ddd d MMM HH:mm}; 5h window not reported' -f
+            $Usage.Provider, ($Usage.Plan ?? 'plan not reported'), ($Usage.Brand ?? 'brand not reported'), $used, [Math]::Round(100 - $used, 1), $period, $Usage.WeekReset)
+    }
     if ($Usage.Known) {
         return ('{0} ({1}): 5h {2:P0} used, resets {3:ddd HH:mm}; week {4:P0} used, resets {5:ddd HH:mm}' -f
             $Usage.Provider, $Usage.Plan, $Usage.FiveH, $Usage.FiveHReset, $Usage.Week, $Usage.WeekReset)
@@ -270,4 +369,5 @@ function Format-UsageLine {
 }
 
 Export-ModuleMember -Function Get-KitHome, Get-Budget, Get-ProviderOf, Add-LedgerEntry, Get-LedgerSpend, Get-CodexUsage, ConvertFrom-CodexUsage,
+    Get-CursorAuthPath, Get-CursorUsage, ConvertFrom-CursorUsage,
     Get-ProviderUsage, Get-GateDecision, Wait-LimitGate, Format-UsageLine

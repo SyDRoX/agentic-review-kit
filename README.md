@@ -119,7 +119,8 @@ when it disagrees.
   "run": { "max_usd": 3.0, "max_tokens": null, "max_minutes": 120 },
   "self_metered": { "xai": { "five_h_usd": 5.0, "week_usd": 25.0 } },
   "models": { "finder": "openai-codex/<model>", "refute": "xai/<model>", "thinking": null },
-  "coderabbit": { "per_hour": 3 }
+  "coderabbit": { "per_hour": 3 },
+  "cursor": { "applies_to": [] }
 }
 ```
 
@@ -131,6 +132,7 @@ when it disagrees.
 | `run` | Caps for one `review` or one whole `sweep`. |
 | `self_metered` | Spend caps, per provider, for providers that report no quota. |
 | `models` | Default finder and refute models, as pi model ids. Unset: pi's default model. |
+| `cursor.applies_to` | Providers whose quota is the Cursor subscription pool, for example `["xai"]`. Empty: the pool is reported, not enforced. |
 
 How each provider is read:
 
@@ -138,7 +140,13 @@ How each provider is read:
 |---|---|---|
 | `openai-codex` (ChatGPT plan) | 5-hour and weekly percent used, with reset times | the plan's own usage endpoint, with pi's token |
 | `xai` (SuperGrok, X Premium) | none found: the API reports only per-minute request and token limits | the kit's ledger against `self_metered` caps |
+| `cursor` (Cursor Agent CLI login) | percent used of one billing period, with its reset time; no 5-hour window | the usage call the CLI itself makes, with the CLI's token |
 | anything else | none | the kit's ledger; add a `self_metered` entry to cap it |
+
+The Cursor reading is the subscription pool of the Cursor Agent login. `ark usage` always reports it when the CLI is logged in. It is
+enforced as the quota of another provider only when you list that provider in `cursor.applies_to`: the kit cannot prove that two logins draw
+on one allowance, so you decide. One way to check: note the percentage, run one chunk on the other provider, and read it again. The call is
+not a documented interface and can change with any CLI release; when it fails, the line says so and nothing is assumed.
 
 The kit never estimates a percentage. A provider without a quota signal is shown as "not reported", with the spend the kit itself recorded.
 That spend is pi's API-equivalent price for the tokens, not a charge; on a subscription it is a relative measure only. A step that ends with
