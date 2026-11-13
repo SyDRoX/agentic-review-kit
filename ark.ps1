@@ -15,6 +15,14 @@
     ark baseline [-Repo <path>]
         Mark the current head as the start for later reviews, without reviewing what came before.
 
+    ark audit-plan [-Repo <path>] [-Paths <glob,...>] [-MaxLines 800] [-IncludeTests] [-Force]
+        Divide the current code into chunks by folder and write the plan. Reads no history and runs no model.
+        Tests, vendor code, generated files and docs are left out. Contract code comes first, then hot paths.
+
+    ark audit   [-Repo <path>] [-Count <n> | -All | -Chunk <id>] [-Level ...] [-NoRefute] [-NoWait] [-DryRun]
+        Audit the next chunks of the plan as the code is now: no diff, old defects count.
+        With -Paths <glob,...> and no plan: audit exactly those files once.
+
     ark assess  [-Repo <path>] [-Base <ref>] [-Head <ref>]
         Size the change and print the plan. Runs no model.
 
@@ -41,11 +49,12 @@ param(
     [ValidateSet('pi', 'coderabbit', 'both')] [string] $Backend,
     [string] $Model, [string] $RefuteModel,
     [string] $Type, [string] $Targets,
+    [string[]] $Paths = @(), [int] $MaxLines = 800, [int] $Count = 1, [int] $Chunk, [switch] $All, [switch] $IncludeTests,
     [switch] $NoRefute, [switch] $DryRun, [switch] $Wait, [switch] $NoWait, [switch] $Force, [switch] $Full
 )
 
 $ErrorActionPreference = 'Stop'
-foreach ($m in 'Scope', 'Harness', 'Limits', 'Findings', 'Rabbit', 'Review') { Import-Module (Join-Path $PSScriptRoot "lib/$m.psm1") -Force }
+foreach ($m in 'Scope', 'Harness', 'Limits', 'Findings', 'Rabbit', 'Audit', 'Review') { Import-Module (Join-Path $PSScriptRoot "lib/$m.psm1") -Force }
 
 function Get-RepoType([string] $Root) {
     if (Test-Path -LiteralPath (Join-Path $Root 'ProjectSettings/ProjectVersion.txt')) { return 'unity' }
@@ -129,6 +138,77 @@ function Invoke-Sweep {
     Write-Host "Report: $report"
 }
 
+function Invoke-AuditPlan {
+    $root = ([string] (Invoke-Git $Repo @('rev-parse', '--show-toplevel'))).Trim()
+    $old = Read-AuditPlan -Root $root
+    if ($old -and @($old.chunks | Where-Object Status -eq 'done').Count -and -not $Force) {
+        throw "a plan with finished chunks exists at $(Get-AuditPlanPath $root); use -Force to replace it and start over"
+    }
+    $prof = Get-ReviewProfile -Root $root
+    $files = @(Get-AuditFile -Root $root -ReviewProfile $prof -Paths $Paths -IncludeTests:$IncludeTests)
+    if (-not $files.Count) { throw 'no source files in scope; check -Paths and the vendor and tests globs of the profile' }
+    $null = Initialize-RunFolder -Root $root
+    $plan = [ordered]@{
+        created = [datetime]::UtcNow.ToString('o'); head = ([string] (Invoke-Git $root @('rev-parse', 'HEAD'))).Trim()
+        maxLines = $MaxLines; paths = $Paths; chunks = @(Split-AuditChunk -Files $files -MaxLines $MaxLines -ReviewProfile $prof)
+    }
+    Write-AuditPlan -Root $root -Plan $plan
+    Format-AuditPlan -Plan (Read-AuditPlan -Root $root) | ForEach-Object { Write-Host $_ }
+    Write-Host "Plan: $(Get-AuditPlanPath $root)"
+    Write-Host 'Largest folders in scope (check for third-party code and add it to "vendor" in .review-kit/profile.json):'
+    $files | Group-Object { ($_.Path.Split('/') | Select-Object -First 3) -join '/' } | ForEach-Object { [pscustomobject]@{ Dir = $_.Name; Lines = ($_.Group | Measure-Object Lines -Sum).Sum; Files = $_.Count } } |
+        Sort-Object Lines -Descending | Select-Object -First 12 | ForEach-Object { Write-Host ('  {0,7} lines {1,4} files  {2}' -f $_.Lines, $_.Files, $_.Dir) }
+}
+
+function Invoke-AuditRun {
+    $root = ([string] (Invoke-Git $Repo @('rev-parse', '--show-toplevel'))).Trim()
+    $budget = Get-Budget
+    $common = @{ Repo = $root; Level = $Level; NoRefute = $NoRefute; DryRun = $DryRun; Wait = (-not $NoWait); Budget = $budget }
+    if ($Model) { $common.Model = $Model }
+    if ($RefuteModel) { $common.RefuteModel = $RefuteModel }
+
+    $plan = Read-AuditPlan -Root $root
+    if ($Paths.Count -and -not $Chunk) {
+        $files = @(Get-AuditFile -Root $root -ReviewProfile (Get-ReviewProfile -Root $root) -Paths $Paths -IncludeTests:$IncludeTests)
+        if (-not $files.Count) { throw 'no source files match -Paths' }
+        $r = Invoke-Audit @common -Files @($files.Path) -Name 'paths'
+        exit $(if ($r.Status -in 'done', 'nothing', 'dry-run') { 0 } elseif ($r.Status -eq 'budget') { 3 } else { 1 })
+    }
+    if (-not $plan) { throw "no audit plan in $root; run 'ark audit-plan' first, or pass -Paths" }
+
+    $todo = if ($Chunk) { @($plan.chunks | Where-Object Id -eq $Chunk) } else { @($plan.chunks | Where-Object Status -ne 'done') }
+    if (-not $todo.Count) { Write-Host 'audit: every chunk of the plan is done'; return }
+    if (-not $All -and -not $Chunk) { $todo = @($todo | Select-Object -First $Count) }
+
+    $run = "audit-$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())"
+    $started = Get-Date
+    $stop = Join-Path (Get-KitHome) 'STOP'
+    $fails = 0
+    $code = 0
+    foreach ($c in $todo) {
+        if (Test-Path -LiteralPath $stop) { Write-Host 'audit: STOP file found, stopping'; break }
+        Write-Host "=== chunk $($c.Id): $($c.Name) ($($c.Lines) lines, $(@($c.Files).Count) files)"
+        $r = Invoke-Audit @common -Files @($c.Files) -Name "chunk$($c.Id)" -RunId $run -RunStarted $started
+        if ($DryRun) { continue }
+
+        $c.Status = $r.Status; $c.Note = $r.Reason; $c.Head = $r.Head; $c.Tokens = $r.Tokens
+        if ($r.Status -eq 'done') { $c.File = $r.File; $c.Findings = $r.Findings; $c.Confirmed = $r.Confirmed; $c.Unclear = $r.Unclear; $c.Refuted = $r.Refuted; $fails = 0 }
+        elseif ($r.Status -eq 'nothing') { $c.Status = 'done'; $c.Findings = 0; $c.Confirmed = 0; $c.Unclear = 0; $c.Refuted = 0 }
+        else { $fails++ }
+        Write-AuditPlan -Root $root -Plan $plan
+
+        # A budget stop ends the run: the next chunk would hit the same wall. So do two failures in a row.
+        if ($r.Status -eq 'budget') { $code = 3; break }
+        if ($fails -ge 2) { Write-Host 'audit: two chunks failed in a row, stopping'; $code = 1; break }
+    }
+    if (-not $DryRun) {
+        Format-AuditPlan -Plan (Read-AuditPlan -Root $root) | Select-Object -Last 2 | ForEach-Object { Write-Host $_ }
+        $spend = Get-LedgerSpend -Run $run
+        Write-Host ('Run: {0} tokens, {1:N2} USD (API-equivalent), {2} min. Plan: {3}' -f $spend.Tokens, $spend.Usd, [int] ((Get-Date) - $started).TotalMinutes, (Get-AuditPlanPath $root))
+    }
+    exit $code
+}
+
 function Invoke-FixPrompt {
     if (-not $Argument -or -not (Test-Path -LiteralPath $Argument)) { throw 'ark fix needs the path of a findings file' }
     $file = (Resolve-Path -LiteralPath $Argument).Path
@@ -157,6 +237,8 @@ switch ($Command.ToLowerInvariant()) {
         Write-Host "baseline: reviews of $(if ($branch) { $branch } else { 'the detached head' }) in $root now start at $($head.Substring(0, 8))"
     }
     'sweep' { Invoke-Sweep }
+    'audit-plan' { Invoke-AuditPlan }
+    'audit' { Invoke-AuditRun }
     'usage' { Invoke-Usage }
     'init' { Invoke-Init }
     'fix' { Invoke-FixPrompt }

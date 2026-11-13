@@ -308,6 +308,14 @@ Describe 'Limits: budget file, ledger and Codex reply' {
         $b.self_metered.xai.five_h_usd | Should -Be 5.0
     }
 
+    It 'reads an empty quiet list from the file as no window' {
+        Set-Content (Join-Path $script:Home_ 'budget.json') '{"quiet":[],"run":{"max_usd":null}}'
+        $b = Get-Budget
+        @($b.quiet).Count | Should -Be 0
+        $u = [pscustomobject]@{ Known = $true; Provider = 'p'; FiveH = 0.1; Week = 0.1; LimitReached = $false; FiveHReset = (Get-Date); WeekReset = (Get-Date) }
+        (Get-GateDecision -Usage $u -Budget $b).Action | Should -Be 'go'
+    }
+
     It 'rejects a threshold outside (0, 1]' {
         Set-Content (Join-Path $script:Home_ 'budget.json') '{"week_stop":70}'
         { Get-Budget } | Should -Throw '*week_stop*'
@@ -460,5 +468,108 @@ Describe 'Rabbit: output' {
 
     It 'returns nothing for plain text' {
         (ConvertFrom-RabbitOutput -Text 'No issues found.').Count | Should -Be 0
+    }
+}
+
+Describe 'Audit: chunks' {
+    BeforeAll { Import-Module (Join-Path $script:Kit 'lib/Audit.psm1') -Force }
+
+    It 'keeps a folder that fits as one chunk' {
+        $files = @([pscustomobject]@{ Path = 'src/a.ts'; Lines = 100 }, [pscustomobject]@{ Path = 'src/b.ts'; Lines = 200 })
+        $c = @(Split-AuditChunk -Files $files -MaxLines 800)
+        $c.Count | Should -Be 1
+        $c[0].Lines | Should -Be 300
+        $c[0].Files | Should -Be @('src/a.ts', 'src/b.ts')
+        $c[0].Status | Should -Be 'todo'
+    }
+
+    It 'splits along folders, joins small neighbours and never exceeds the limit except for one big file' {
+        $files = @(
+            [pscustomobject]@{ Path = 'Assets/Scripts/Skills/A.cs'; Lines = 400 }
+            [pscustomobject]@{ Path = 'Assets/Scripts/Skills/B.cs'; Lines = 300 }
+            [pscustomobject]@{ Path = 'Assets/Scripts/UI/C.cs'; Lines = 100 }
+            [pscustomobject]@{ Path = 'Assets/Scripts/UI/D.cs'; Lines = 100 }
+            [pscustomobject]@{ Path = 'Assets/Scripts/Util/E.cs'; Lines = 150 }
+            [pscustomobject]@{ Path = 'Assets/Scripts/Huge.cs'; Lines = 2000 }
+            [pscustomobject]@{ Path = 'Assets/Scripts/Tiny.cs'; Lines = 20 }
+        )
+        $c = @(Split-AuditChunk -Files $files -MaxLines 800)
+        ($c.Files | Sort-Object) | Should -Be (@($files.Path) | Sort-Object)
+        @($c | Where-Object { $_.Lines -gt 800 -and @($_.Files).Count -gt 1 }).Count | Should -Be 0
+        ($c | Where-Object { $_.Files -contains 'Assets/Scripts/Huge.cs' }).Files.Count | Should -Be 1
+        ($c | Where-Object { $_.Files -contains 'Assets/Scripts/Skills/A.cs' }).Files | Should -Contain 'Assets/Scripts/Skills/B.cs'
+        ($c | Where-Object { $_.Files -contains 'Assets/Scripts/UI/C.cs' }).Files | Should -Contain 'Assets/Scripts/Util/E.cs'
+        $c.Id | Should -Be (1..$c.Count)
+    }
+
+    It 'gives the same chunks for the same files in any order' {
+        $files = 1..40 | ForEach-Object { [pscustomobject]@{ Path = "src/m$($_ % 5)/f$_.ts"; Lines = 90 + $_ } }
+        $a = Split-AuditChunk -Files $files -MaxLines 500 | ConvertTo-Json -Depth 4
+        $b = Split-AuditChunk -Files ($files | Sort-Object Lines -Descending) -MaxLines 500 | ConvertTo-Json -Depth 4
+        $a | Should -Be $b
+    }
+
+    It 'puts contract chunks first, then hot paths' {
+        $files = @(
+            [pscustomobject]@{ Path = 'src/a/x.ts'; Lines = 700 }
+            [pscustomobject]@{ Path = 'src/hot/y.ts'; Lines = 700 }
+            [pscustomobject]@{ Path = 'src/net/z.ts'; Lines = 700 }
+        )
+        $prof = [pscustomobject]@{ contracts = @('src/net/**'); hot = @('src/hot/**') }
+        $c = @(Split-AuditChunk -Files $files -MaxLines 800 -ReviewProfile $prof)
+        $c.Priority | Should -Be @(0, 1, 2)
+        $c[0].Files | Should -Be @('src/net/z.ts')
+    }
+
+    It 'returns nothing for no files' {
+        @(Split-AuditChunk -Files @()).Count | Should -Be 0
+    }
+}
+
+Describe 'Audit: files and plan' {
+    BeforeEach { $script:Repo = New-TestRepo }
+    AfterEach { Remove-Item $script:Repo -Recurse -Force -ErrorAction SilentlyContinue }
+
+    It 'lists own source files and leaves out tests, vendor code, docs and data' {
+        $null = Add-TestCommit $script:Repo 'src/game/play er.ts' "a`nb`nc"
+        $null = Add-TestCommit $script:Repo 'test/api.test.ts' 'x'
+        $null = Add-TestCommit $script:Repo 'Assets/Plugins/Lib/Lib.cs' 'x'
+        $null = Add-TestCommit $script:Repo 'copied/thing.ts' 'x'
+        $null = Add-TestCommit $script:Repo 'README.md' 'x'
+        $null = Add-TestCommit $script:Repo 'data/big.json' '{}'
+        $prof = [pscustomobject]@{ tests = @(); vendor = @('copied/**') }
+        $f = @(Get-AuditFile -Root $script:Repo -ReviewProfile $prof)
+        ($f.Path | Sort-Object) | Should -Be @('a.ts', 'src/game/play er.ts')
+        ($f | Where-Object Path -eq 'src/game/play er.ts').Lines | Should -Be 3
+        @(Get-AuditFile -Root $script:Repo -ReviewProfile $prof -Paths @('src/**')).Count | Should -Be 1
+        (Get-AuditFile -Root $script:Repo -ReviewProfile $prof -IncludeTests).Path | Should -Contain 'test/api.test.ts'
+    }
+
+    It 'writes a plan that reads back and reports measured cost only after a chunk is done' {
+        $null = New-Item -ItemType Directory -Force (Join-Path $script:Repo '.review-kit/runs')
+        $chunks = @(Split-AuditChunk -Files @([pscustomobject]@{ Path = 'a.ts'; Lines = 100 }, [pscustomobject]@{ Path = 'b/c.ts'; Lines = 900 }) -MaxLines 800)
+        Write-AuditPlan -Root $script:Repo -Plan ([ordered]@{ head = 'x'; chunks = $chunks })
+        $plan = Read-AuditPlan -Root $script:Repo
+        @($plan.chunks).Count | Should -Be 2
+        (Format-AuditPlan -Plan $plan)[-1] | Should -Match 'no measured cost'
+        $plan.chunks[0].Status = 'done'; $plan.chunks[0].Tokens = 50000; $plan.chunks[0].Findings = 1
+        $text = Format-AuditPlan -Plan $plan
+        $text[-1] | Should -Match 'tokens per line over 1 done chunk'
+        $text[-2] | Should -Match 'done 1; left 1 chunks'
+    }
+}
+
+Describe 'Audit: prompt' {
+    It 'asks for defects in existing code, lists files with sizes and adds the reads to the call budget' {
+        $target = [pscustomobject]@{ Root = 'C:\repo'; Head = 'a' * 40; From = 'a' * 40; WorkTree = $true; DiffArgs = @() }
+        $size = [pscustomobject]@{ Files = @([pscustomobject]@{ Path = 'src/a.ts'; Bucket = 'prod'; Added = 120; Deleted = 0 }, [pscustomobject]@{ Path = 'src/b.ts'; Bucket = 'prod'; Added = 80; Deleted = 0 }) }
+        $prof = [pscustomobject]@{ notes = ''; conventions = @(); counterparts = @() }
+        $p = Format-FinderPrompt -Target $target -Size $size -ReviewProfile $prof -Level medium -Lens correctness -Mode audit
+        $p | Should -Not -Match '\{\{'
+        $p | Should -Match 'There is no diff'
+        $p | Should -Match 'however long it has been there'
+        $p | Should -Match 'src/a\.ts \(120 lines\)'
+        $p | Should -Match 'At most 22 tool calls'
+        $p | Should -Not -Match 'git -C .* diff'
     }
 }

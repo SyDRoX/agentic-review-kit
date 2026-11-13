@@ -1,6 +1,6 @@
 ---
 name: ark-review
-description: Budget-aware code review of the current repository with agentic-review-kit. Use for "review my changes", "review this branch", "code review", "/skill:ark-review", "apply the review findings", "how much of my plan limit is left". Sizes the change, runs finder and refute passes as separate headless sessions inside a 5-hour and weekly budget, and writes a findings file. Optional args - a base ref, a level (low, medium, high, xhigh, max), `fix <findings file>`, `usage`.
+description: Budget-aware code review of the current repository with agentic-review-kit. Use for "review my changes", "review this branch", "code review", "audit this project", "review the existing code", "/skill:ark-review", "apply the review findings", "how much of my plan limit is left". Sizes the change, runs finder and refute passes as separate headless sessions inside a 5-hour and weekly budget, and writes a findings file. Optional args - a base ref, a level (low, medium, high, xhigh, max), `fix <findings file>`, `usage`.
 ---
 
 # ark-review
@@ -27,6 +27,18 @@ on another model to get around it.
 
 `review: nothing -` means there is no unreviewed change. `review: too-large -` means the range is too big for an automatic review: print the
 line and ask the user for a base ref.
+
+## Audit existing code
+
+When the user asks to review code that already exists (a backlog, a whole subsystem, "audit this project") and not a change:
+
+1. No plan yet: run `<ark> audit-plan -Repo "<repository root>"`. Print the totals and the "Largest folders" list. If a listed folder is
+   third-party code, tell the user to add it to `vendor` in `.review-kit/profile.json` and stop.
+2. Run `<ark> audit -Repo "<repository root>"` for the next chunk (60-minute command timeout). Add `-Count <n>` for several, `-All` only
+   when the user asked for the whole plan, `-Level <level>` when the user named one.
+3. Print the `Assessment:`, `Plan:`, `budget:`, `Refute:`, `Findings:`, `Total:` and `Measured:` lines as they are, then list the findings
+   as in Review step 3.
+4. Stop. Report how many chunks are left. Do not start another chunk unless the user asked for more than one.
 
 ## Fix
 

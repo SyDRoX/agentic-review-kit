@@ -32,7 +32,9 @@ function Merge-Table {
     if ($null -eq $Over) { return $out }
     $props = if ($Over -is [hashtable]) { $Over.Keys } else { $Over.PSObject.Properties.Name }
     foreach ($k in $props) {
-        $v = if ($Over -is [hashtable]) { $Over[$k] } else { $Over.$k }
+        # Plain assignments: an `if` used as an expression turns an empty array into null.
+        $v = $null
+        if ($Over -is [hashtable]) { $v = $Over[$k] } else { $v = $Over.$k }
         if ($out[$k] -is [hashtable] -and ($v -is [hashtable] -or $v -is [pscustomobject])) { $out[$k] = Merge-Table $out[$k] $v }
         elseif ($v -is [pscustomobject]) { $out[$k] = Merge-Table @{} $v }
         else { $out[$k] = $v }
@@ -193,7 +195,7 @@ function Get-GateDecision {
     }
     if ($run.max_minutes -and ($Now - $RunStarted).TotalMinutes -ge $run.max_minutes) { return & $decide 'stop' "run time spent: $($run.max_minutes) min" $null }
 
-    foreach ($q in @($Budget.quiet)) {
+    foreach ($q in @($Budget.quiet | Where-Object { $_ })) {
         $a = [datetime] $q[0]; $b = [datetime] $q[1]
         if ($a -le $Now -and $Now -lt $b) { return & $decide 'wait' ('quiet window until {0:ddd HH:mm}' -f $b) $b }
     }

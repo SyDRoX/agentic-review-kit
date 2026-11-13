@@ -98,11 +98,16 @@ function Format-FinderPrompt {
         [Parameter(Mandatory)] $Size,
         [Parameter(Mandatory)] $ReviewProfile,
         [Parameter(Mandatory)] [string] $Level,
-        [Parameter(Mandatory)] [string] $Lens
+        [Parameter(Mandatory)] [string] $Lens,
+        [ValidateSet('change', 'audit')] [string] $Mode = 'change'
     )
 
     $lv = $script:Levels[$Level]
-    $files = @($Size.Files | ForEach-Object { "- $($_.Path) ($($_.Bucket), +$($_.Added) -$($_.Deleted))" }) -join "`n"
+    $audit = $Mode -eq 'audit'
+    $files = if ($audit) { @($Size.Files | ForEach-Object { "- $($_.Path) ($($_.Added) lines)" }) -join "`n" }
+    else { @($Size.Files | ForEach-Object { "- $($_.Path) ($($_.Bucket), +$($_.Added) -$($_.Deleted))" }) -join "`n" }
+    # An audit must read every listed file once before anything else, so those reads come on top of the level's budget.
+    $calls = if ($audit) { $lv.Calls + $Size.Files.Count } else { $lv.Calls }
     $notes = if ($ReviewProfile.notes) { "## Project notes`n`n$($ReviewProfile.notes)" } else { '' }
 
     $conv = @($ReviewProfile.conventions | Where-Object { Test-Path -LiteralPath (Join-Path $Target.Root $_) })
@@ -114,16 +119,16 @@ function Format-FinderPrompt {
     $cps = @($ReviewProfile.counterparts | Where-Object { $_.path -and (Test-Path -LiteralPath $_.path) })
     $counterparts = if ($cps.Count) {
         $rows = @($cps | ForEach-Object { "- $($_.path)$(if ($_.note) { ": $($_.note)" })" }) -join "`n"
-        "## Counterpart repositories`n`nThis repository shares a contract with:`n`n$rows`n`nWhen the change touches data, a route or a file format the counterpart also reads or writes, read the counterpart's side (read-only) and report a mismatch as a finding on the line of THIS change that causes it."
+        "## Counterpart repositories`n`nThis repository shares a contract with:`n`n$rows`n`nWhen $(if ($audit) { 'a listed file' } else { 'the change' }) touches data, a route or a file format the counterpart also reads or writes, read the counterpart's side (read-only) and report a mismatch as a finding on the line in THIS repository that causes it."
     }
     else { '' }
 
     $diffCmd = "git -C `"$($Target.Root)`" diff $($Target.DiffArgs -join ' ')"
-    $t = [System.IO.File]::ReadAllText((Join-Path $script:KitRoot 'prompts/finder.md'))
+    $t = [System.IO.File]::ReadAllText((Join-Path $script:KitRoot $(if ($audit) { 'prompts/audit.md' } else { 'prompts/finder.md' })))
     $map = [ordered]@{
         '{{ROOT}}' = $Target.Root; '{{DIFF_CMD}}' = $diffCmd; '{{FILES}}' = $files; '{{SOURCE}}' = (Get-SourceForm $Target)
         '{{LENS}}' = $script:Lenses[$Lens]; '{{DEPTH}}' = $lv.Depth; '{{PROFILE}}' = $notes; '{{CONVENTIONS}}' = $conventions
-        '{{COUNTERPARTS}}' = $counterparts; '{{CALLS}}' = [string] $lv.Calls; '{{CAP}}' = [string] $lv.Cap
+        '{{COUNTERPARTS}}' = $counterparts; '{{CALLS}}' = [string] $calls; '{{CAP}}' = [string] $lv.Cap
     }
     foreach ($k in $map.Keys) { $t = $t.Replace($k, [string] $map[$k]) }
     return ($t -replace '(\r?\n){3,}', "`n`n")
@@ -245,6 +250,105 @@ function Invoke-StepBatch {
     return , $results.ToArray()
 }
 
+function Invoke-Pipeline {
+    <#
+    .SYNOPSIS
+        The part every kind of review shares: budget gate, finder passes, findings file, refute. Fills $Result in place.
+        Mode 'change' reviews a diff; mode 'audit' reviews listed files as they are.
+    #>
+    param(
+        [Parameter(Mandatory)] $Target, [Parameter(Mandatory)] $Size, [Parameter(Mandatory)] $ReviewProfile,
+        [Parameter(Mandatory)] [string] $Lvl, [Parameter(Mandatory)] [string] $SizeLine, [Parameter(Mandatory)] [string] $Name,
+        [ValidateSet('change', 'audit')] [string] $Mode = 'change',
+        [string] $Backend = 'pi', [string] $Model, [string] $RefuteModel, [switch] $NoRefute, [switch] $Wait,
+        [Parameter(Mandatory)] [hashtable] $Budget, [string] $RunId, [datetime] $RunStarted = (Get-Date),
+        [Parameter(Mandatory)] [scriptblock] $Log, [Parameter(Mandatory)] $Result
+    )
+
+    $root = $Target.Root
+    $lv = $script:Levels[$Lvl]
+    $thinking = if ($Budget.models.thinking) { $Budget.models.thinking } else { $lv.Thinking }
+    $usePi = $Backend -in 'pi', 'both'
+    $useRabbit = $Backend -in 'coderabbit', 'both'
+    $fail = { param($status, $reason) $Result.Status = $status; $Result.Reason = $reason; & $Log "review: $status - $reason" }
+
+    # A sweep shares one run id across reviews, so the run budget covers all of them.
+    $stamp = [string] [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    $run = if ($RunId) { $RunId } else { $stamp }
+    $started = Get-Date
+    $runs = Initialize-RunFolder -Root $root
+    $logDir = Join-Path $runs "$stamp-$($Name -replace '[^A-Za-z0-9._-]', '_')"
+    $notes = [System.Collections.Generic.List[string]]::new()
+    $all = [System.Collections.Generic.List[object]]::new()
+    $inScope = @($Size.Files | ForEach-Object { $_.Path })
+
+    if ($usePi) {
+        $gate = Wait-LimitGate -Provider (Get-ProviderOf $Model) -Budget $Budget -Run $run -RunStarted $RunStarted -Wait:$Wait -Log $Log
+        & $Log "budget: $($gate.Action) - $($gate.Reason)"
+        if ($gate.Action -ne 'go') { & $fail 'budget' $gate.Reason; return }
+
+        $jobs = @($lv.Lenses | ForEach-Object { @{ Name = "finder-$_"; Prompt = (Format-FinderPrompt -Target $Target -Size $Size -ReviewProfile $ReviewProfile -Level $Lvl -Lens $_ -Mode $Mode) } })
+        $passes = Invoke-StepBatch -Jobs $jobs -Target $Target -LogDirectory $logDir -Model $Model -Thinking $thinking -Run $run
+        $failed = 0
+        foreach ($r in $passes) {
+            $Result.Tokens += $r.Tokens; $Result.Usd += $r.Usd
+            if ($r.Error) { $failed++; $notes.Add("$($r.Name) failed: $($r.Error)"); & $Log "$($r.Name): FAILED $($r.Error)"; continue }
+            $items = Get-JsonTail -Text $r.Text -Kind array
+            if ($null -eq $items) { $failed++; $notes.Add("$($r.Name) returned no findings array"); & $Log "$($r.Name): no findings array in the reply ($($r.LogPath))"; continue }
+            $c = ConvertTo-Finding -Items $items -Root $root -ChangedPaths $inScope
+            & $Log "$($r.Name): $($c.Findings.Count) findings$(if ($c.Dropped) { ", $($c.Dropped) dropped as malformed or out of scope" }), $($r.Tokens) tokens, $($r.Seconds) s"
+            foreach ($f in $c.Findings) { $all.Add($f) }
+        }
+        if ($failed -eq $passes.Count) {
+            $limit = @($passes | Where-Object LimitHit).Count -gt 0
+            & $fail $(if ($limit) { 'budget' } else { 'failed' }) "every finder pass failed: $($notes -join '; ')"
+            return
+        }
+    }
+
+    if ($useRabbit) {
+        $rb = Invoke-RabbitReview -Target $Target -LogDirectory $logDir -Budget $Budget -Run $run
+        & $Log "coderabbit: $($rb.Reason)"
+        if (-not $rb.Ran) { $notes.Add("coderabbit skipped: $($rb.Reason)") }
+        $c = ConvertTo-Finding -Items $rb.Findings -Root $root -ChangedPaths $inScope
+        foreach ($f in $c.Findings) { $all.Add($f) }
+        if (-not $usePi -and -not $rb.Ran) { & $fail 'failed' $rb.Reason; return }
+    }
+
+    $merged = Merge-Finding -Findings $all.ToArray() -Cap $lv.Cap
+    if ($merged.Total -gt $merged.Findings.Count) { $notes.Add("reported $($merged.Findings.Count) of $($merged.Total) findings (cap at level $Lvl)") }
+    $file = Join-Path $runs "$($Name -replace '[^A-Za-z0-9._-]', '_')-$stamp.md"
+    Write-FindingsFile -Path $file -Target $Target -Level $Lvl -SizeLine $SizeLine -Findings $merged.Findings -Notes $notes.ToArray()
+    $Result.File = $file
+    $Result.Findings = $merged.Findings.Count
+
+    if ($NoRefute) { & $Log (Set-RefuteSkipped -Path $file -Reason '--no-refute') }
+    elseif ($merged.Findings.Count) {
+        $gate = Wait-LimitGate -Provider (Get-ProviderOf $RefuteModel) -Budget $Budget -Run $run -RunStarted $RunStarted -Wait:$Wait -Log $Log
+        if ($gate.Action -ne 'go') { & $Log (Set-RefuteSkipped -Path $file -Reason "budget: $($gate.Reason)") }
+        else {
+            $doc = Read-FindingsFile -Path $file
+            $jobs = @($doc.Findings | ForEach-Object { @{ Name = "refute-F$($_.Id)"; Prompt = (Format-RefutePrompt -Finding $_ -Target $Target) } })
+            $answers = Invoke-StepBatch -Jobs $jobs -Target $Target -LogDirectory $logDir -Model $RefuteModel -Thinking 'low' -Run $run -TimeoutSec 900
+            $verdicts = [System.Collections.Generic.List[object]]::new()
+            foreach ($r in $answers) {
+                $Result.Tokens += $r.Tokens; $Result.Usd += $r.Usd
+                $v = Get-JsonTail -Text $r.Text -Kind object
+                $id = [int] ($r.Name -replace '^refute-F', '')
+                if ($v -and [string] $v.id -eq [string] $id -and ([string] $v.verdict).ToUpperInvariant() -in 'REFUTED', 'CONFIRMED', 'UNCLEAR') { $verdicts.Add($v) }
+            }
+            $line = Set-RefuteVerdict -Path $file -Verdicts $verdicts.ToArray() -Model $(if ($RefuteModel) { $RefuteModel } else { 'pi default model' })
+            & $Log $line
+            $after = Read-FindingsFile -Path $file
+            $Result.Refuted = @($after.Findings | Where-Object Refute -eq 'REFUTED').Count
+            $Result.Confirmed = @($after.Findings | Where-Object Refute -eq 'CONFIRMED').Count
+            $Result.Unclear = @($after.Findings | Where-Object Refute -eq 'UNCLEAR').Count
+        }
+    }
+
+    & $Log "Findings: $file"
+    & $Log ('Spent: {0} tokens, {1:N2} USD (API-equivalent), {2} s' -f $Result.Tokens, $Result.Usd, [int] ((Get-Date) - $started).TotalSeconds)
+}
 function Invoke-Review {
     <#
     .SYNOPSIS
@@ -314,85 +418,84 @@ function Invoke-Review {
     & $Log $plan
     if ($DryRun) { return & $finish 'dry-run' 'nothing was run' }
 
-    # A sweep shares one run id across reviews, so the run budget covers all of them.
-    $stamp = [string] [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-    $run = if ($RunId) { $RunId } else { $stamp }
-    $started = Get-Date
-    $runs = Initialize-RunFolder -Root $root
-    $logDir = Join-Path $runs $stamp
-    $notes = [System.Collections.Generic.List[string]]::new()
-    $all = [System.Collections.Generic.List[object]]::new()
-    $changed = @($size.Files | ForEach-Object { $_.Path })
+    $a = @{ Target = $target; Size = $size; ReviewProfile = $profile_; Lvl = $lvl; SizeLine = $sizeLine; Mode = 'change'; Backend = $Backend
+        Name = "review-$(if ($branch) { $branch } else { $target.Head.Substring(0, 8) })"; Model = $Model; RefuteModel = $RefuteModel
+        NoRefute = $NoRefute; Wait = $Wait; Budget = $Budget; RunId = $RunId; RunStarted = $RunStarted; Log = $Log; Result = $result }
+    Invoke-Pipeline @a
+    if ($result.File) { Set-LastReview -Root $root -Branch $branch -Head $target.Head -File $result.File }
+    return [pscustomobject] $result
+}
 
-    if ($usePi) {
-        $gate = Wait-LimitGate -Provider (Get-ProviderOf $Model) -Budget $Budget -Run $run -RunStarted $RunStarted -Wait:$Wait -Log $Log
-        & $Log "budget: $($gate.Action) - $($gate.Reason)"
-        if ($gate.Action -ne 'go') { return & $finish 'budget' $gate.Reason }
+function Invoke-Audit {
+    <#
+    .SYNOPSIS
+        Audits listed files as they are in the working tree: no diff, and defects count however old they are.
+        Never edits the repository; writes only under .review-kit/runs.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string] $Repo,
+        [Parameter(Mandatory)] [string[]] $Files,
+        [string] $Name = 'audit',
+        [ValidateSet('auto', 'low', 'medium', 'high', 'xhigh', 'max')] [string] $Level = 'auto',
+        [string] $Model, [string] $RefuteModel,
+        [switch] $NoRefute, [switch] $DryRun, [switch] $Wait,
+        [hashtable] $Budget,
+        [string] $RunId, [datetime] $RunStarted = (Get-Date),
+        [scriptblock] $Log = { param($m) Write-Host $m }
+    )
 
-        $jobs = @($lv.Lenses | ForEach-Object { @{ Name = "finder-$_"; Prompt = (Format-FinderPrompt -Target $target -Size $size -ReviewProfile $profile_ -Level $lvl -Lens $_) } })
-        $passes = Invoke-StepBatch -Jobs $jobs -Target $target -LogDirectory $logDir -Model $Model -Thinking $thinking -Run $run
-        $failed = 0
-        foreach ($r in $passes) {
-            $result.Tokens += $r.Tokens; $result.Usd += $r.Usd
-            if ($r.Error) { $failed++; $notes.Add("$($r.Name) failed: $($r.Error)"); & $Log "$($r.Name): FAILED $($r.Error)"; continue }
-            $items = Get-JsonTail -Text $r.Text -Kind array
-            if ($null -eq $items) { $failed++; $notes.Add("$($r.Name) returned no findings array"); & $Log "$($r.Name): no findings array in the reply ($($r.LogPath))"; continue }
-            $c = ConvertTo-Finding -Items $items -Root $root -ChangedPaths $changed
-            & $Log "$($r.Name): $($c.Findings.Count) findings$(if ($c.Dropped) { ", $($c.Dropped) dropped as malformed or outside the change" }), $($r.Tokens) tokens, $($r.Seconds) s"
-            foreach ($f in $c.Findings) { $all.Add($f) }
-        }
-        if ($failed -eq $passes.Count) {
-            $limit = @($passes | Where-Object LimitHit).Count -gt 0
-            return & $finish $(if ($limit) { 'budget' } else { 'failed' }) "every finder pass failed: $($notes -join '; ')"
-        }
+    if (-not $Budget) { $Budget = Get-Budget }
+    if (-not $Model) { $Model = $Budget.models.finder }
+    if (-not $RefuteModel) { $RefuteModel = if ($Budget.models.refute) { $Budget.models.refute } else { $Model } }
+
+    $root = ([string] (Invoke-Git $Repo @('rev-parse', '--show-toplevel'))).Trim()
+    $profile_ = Get-ReviewProfile -Root $root
+    $head = ([string] (Invoke-Git $root @('rev-parse', 'HEAD'))).Trim()
+    $branch = ([string] (Invoke-Git $root @('branch', '--show-current') -AllowFail)).Trim()
+    $dirty = [bool] (Invoke-Git $root @('status', '--porcelain', '--untracked-files=no'))
+
+    $result = [ordered]@{
+        Status = 'done'; Repo = $root; Head = $head; From = $head; Level = $null; File = $null
+        Findings = 0; Refuted = 0; Confirmed = 0; Unclear = 0; Tokens = [long] 0; Usd = [double] 0; Reason = $null
     }
+    $finish = { param($status, $reason) $result.Status = $status; $result.Reason = $reason; & $Log "review: $status - $reason"; [pscustomobject] $result }
 
-    if ($useRabbit) {
-        $rb = Invoke-RabbitReview -Target $target -LogDirectory $logDir -Budget $Budget -Run $run
-        & $Log "coderabbit: $($rb.Reason)"
-        if (-not $rb.Ran) { $notes.Add("coderabbit skipped: $($rb.Reason)") }
-        $c = ConvertTo-Finding -Items $rb.Findings -Root $root -ChangedPaths $changed
-        foreach ($f in $c.Findings) { $all.Add($f) }
-        if (-not $usePi -and -not $rb.Ran) { return & $finish 'failed' $rb.Reason }
+    # The list may be older than the tree: a file deleted since is dropped, and sizes are read now.
+    $entries = [System.Collections.Generic.List[object]]::new()
+    foreach ($f in $Files) {
+        $rel = $f.Replace('\', '/')
+        $full = Join-Path $root $rel
+        if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { continue }
+        $n = 0
+        foreach ($null in [System.IO.File]::ReadLines($full)) { $n++ }
+        $entries.Add([pscustomobject]@{ Path = $rel; Bucket = 'prod'; Added = $n; Deleted = 0 })
     }
+    if (-not $entries.Count) { return & $finish 'nothing' 'none of the listed files exists in the working tree' }
 
-    $merged = Merge-Finding -Findings $all.ToArray() -Cap $lv.Cap
-    if ($merged.Total -gt $merged.Findings.Count) { $notes.Add("reported $($merged.Findings.Count) of $($merged.Total) findings (cap at level $lvl)") }
-    $name = "review-$(($branch ? $branch : $target.Head.Substring(0, 8)) -replace '[^A-Za-z0-9._-]', '_')-$stamp.md"
-    $file = Join-Path $runs $name
-    Write-FindingsFile -Path $file -Target $target -Level $lvl -SizeLine $sizeLine -Findings $merged.Findings -Notes $notes.ToArray()
-    $result.File = $file
-    $result.Findings = $merged.Findings.Count
+    $lines = ($entries | Measure-Object Added -Sum).Sum
+    $size = [pscustomobject]@{ Prod = [int] $lines; ProdFiles = $entries.Count; ProdDel = 0; Test = 0; Generated = 0; Doc = 0; Files = $entries.ToArray() }
+    $signals = @(Get-EffortSignal -Size $size -ReviewProfile $profile_ | Where-Object { $_ -in 'cross-repo contract', 'contract surface', 'hot path' })
+    $band = Get-EffortBand -Size $size -Signals $signals
+    $lvl = if ($Level -eq 'auto') { $band } else { $Level }
+    $result.Level = $lvl
+    $sizeLine = "lines=$lines files=$($entries.Count)"
 
-    if ($NoRefute) { & $Log (Set-RefuteSkipped -Path $file -Reason '--no-refute') }
-    elseif ($merged.Findings.Count) {
-        $gate = Wait-LimitGate -Provider (Get-ProviderOf $RefuteModel) -Budget $Budget -Run $run -RunStarted $RunStarted -Wait:$Wait -Log $Log
-        if ($gate.Action -ne 'go') { & $Log (Set-RefuteSkipped -Path $file -Reason "budget: $($gate.Reason)") }
-        else {
-            $doc = Read-FindingsFile -Path $file
-            $jobs = @($doc.Findings | ForEach-Object { @{ Name = "refute-F$($_.Id)"; Prompt = (Format-RefutePrompt -Finding $_ -Target $target) } })
-            $answers = Invoke-StepBatch -Jobs $jobs -Target $target -LogDirectory $logDir -Model $RefuteModel -Thinking 'low' -Run $run -TimeoutSec 900
-            $verdicts = [System.Collections.Generic.List[object]]::new()
-            foreach ($r in $answers) {
-                $result.Tokens += $r.Tokens; $result.Usd += $r.Usd
-                $v = Get-JsonTail -Text $r.Text -Kind object
-                $id = [int] ($r.Name -replace '^refute-F', '')
-                if ($v -and [string] $v.id -eq [string] $id -and ([string] $v.verdict).ToUpperInvariant() -in 'REFUTED', 'CONFIRMED', 'UNCLEAR') { $verdicts.Add($v) }
-            }
-            $line = Set-RefuteVerdict -Path $file -Verdicts $verdicts.ToArray() -Model $(if ($RefuteModel) { $RefuteModel } else { 'pi default model' })
-            & $Log $line
-            $after = Read-FindingsFile -Path $file
-            $result.Refuted = @($after.Findings | Where-Object Refute -eq 'REFUTED').Count
-            $result.Confirmed = @($after.Findings | Where-Object Refute -eq 'CONFIRMED').Count
-            $result.Unclear = @($after.Findings | Where-Object Refute -eq 'UNCLEAR').Count
-        }
+    $lv = $script:Levels[$lvl]
+    & $Log "Assessment: audit '$Name', $sizeLine, signals: $(if ($signals.Count) { $signals -join ', ' } else { 'none' }) -> $band"
+    & $Log "Plan: level $lvl, $($lv.Lenses.Count) finder pass(es) [$($lv.Lenses -join ', ')] on $(if ($Model) { $Model } else { 'pi default model' })$(if ($NoRefute) { ', no refute' } else { ", refute on $(if ($RefuteModel) { $RefuteModel } else { 'pi default model' })" })"
+    if ($DryRun) { return & $finish 'dry-run' 'nothing was run' }
+
+    $target = [pscustomobject]@{
+        Root = $root; BaseRef = '(none: audit of current code)'; From = $head; Head = $head; WorkTree = $true; Dirty = $dirty
+        Empty = $false; Reason = "audit of $($entries.Count) files as they are, not a diff"; DiffArgs = @(); Branch = $branch
     }
-
-    Set-LastReview -Root $root -Branch $branch -Head $target.Head -File $file
-    & $Log "Findings: $file"
-    & $Log ('Spent: {0} tokens, {1:N2} USD (API-equivalent), {2} s' -f $result.Tokens, $result.Usd, [int] ((Get-Date) - $started).TotalSeconds)
+    $a = @{ Target = $target; Size = $size; ReviewProfile = $profile_; Lvl = $lvl; SizeLine = $sizeLine; Mode = 'audit'; Backend = 'pi'
+        Name = "audit-$Name"; Model = $Model; RefuteModel = $RefuteModel; NoRefute = $NoRefute; Wait = $Wait; Budget = $Budget
+        RunId = $RunId; RunStarted = $RunStarted; Log = $Log; Result = $result }
+    Invoke-Pipeline @a
     return [pscustomobject] $result
 }
 
 Export-ModuleMember -Function Get-ReviewProfile, Get-LastReview, Set-LastReview, Initialize-RunFolder, Format-FinderPrompt, ConvertTo-Finding, Merge-Finding, Write-FindingsFile,
-    Format-RefutePrompt, Invoke-Review
+    Format-RefutePrompt, Invoke-Review, Invoke-Audit

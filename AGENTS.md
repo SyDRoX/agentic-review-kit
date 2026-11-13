@@ -11,6 +11,7 @@ Budget-aware code review run through a headless agent harness. PowerShell 7, tes
 | `lib/Harness.psm1` | Starts one headless agent step and reads its event stream. The only harness-specific code. |
 | `lib/Limits.psm1` | Budget file, provider usage, ledger, the gate decision. |
 | `lib/Review.psm1` | The review itself: prompts, finder passes, findings file, refute. |
+| `lib/Audit.psm1` | Current-code audit scope: file list, folder chunks, the plan file. |
 | `lib/Findings.psm1` | Reads and rewrites a findings file. |
 | `lib/Rabbit.psm1` | CodeRabbit CLI as an optional finder. |
 | `prompts/` | Finder, refute and fix prompts with `{{PLACEHOLDER}}` fields. |

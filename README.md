@@ -54,6 +54,8 @@ In an agent session, `/skill:ark-review` does the same and reports the findings.
 |---|---|
 | `review` | Review a change. `-Base <ref>`, `-Head <ref>`, `-Level`, `-Backend pi\|coderabbit\|both`, `-Model`, `-RefuteModel`, `-NoRefute`, `-Wait`, `-Full`, `-DryRun`. |
 | `assess` | `review -DryRun`. |
+| `audit-plan` | Divide the current code into chunks by folder. `-Paths <glob,...>`, `-MaxLines 800`, `-IncludeTests`, `-Force`. Runs no model. |
+| `audit` | Audit the next chunk of the plan as the code is now. `-Count <n>`, `-All`, `-Chunk <id>`, `-Level`, `-NoWait`. Or `-Paths <glob,...>` for a one-off list. |
 | `baseline` | Mark the current head as reviewed, so later reviews start from here. |
 | `sweep` | Review every repository in `targets.json` that has unreviewed work, inside the budget. Made to run unattended. |
 | `usage` | What is known about each provider's limits, and the kit's own spend. |
@@ -67,6 +69,29 @@ Without `-Head`, the working tree: committed and uncommitted work together. With
 Without `-Base`, the range starts at the head of the previous review of the same branch. On the first review it starts at the merge-base with
 the default branch. `-Full` ignores the previous review. A range over 4000 prod lines is refused unless you type a level: it is nearly always
 a wrong base. Use `-Base`, or `baseline` to start from the current head.
+
+### Auditing code that already exists
+
+`review` reads a diff and reports what the change broke. A backlog that was never reviewed needs the opposite: the code as it is now, with
+no history, where a defect counts however old it is. That is `audit`.
+
+```powershell
+pwsh -File $ark audit-plan -Repo C:/code/my-game     # chunks by folder, at most 800 lines each
+pwsh -File $ark audit -Repo C:/code/my-game          # run the next chunk
+pwsh -File $ark audit -Repo C:/code/my-game -All     # run until the plan is done or the budget stops it
+```
+
+`audit-plan` lists tracked source files, leaves out tests, vendor code, generated files and docs, and divides the rest along the folder
+tree: a folder that fits is one chunk, a larger one is split into its subfolders, small neighbours are joined. Chunks that hold contract
+code run first, then hot paths, then the rest. It also prints the largest folders, so third-party code that slipped in can be added to
+`vendor` in the profile before any model runs.
+
+The plan is `.review-kit/runs/audit-plan.json`. Each chunk records its findings file, counts and tokens, so a stopped run resumes at the
+next open chunk, and the plan prints a measured tokens-per-line rate once one chunk is done. A chunk always reads the working tree at the
+time it runs.
+
+An audit costs more per line than a review: the finder must read every listed file in full. Run one chunk, read the rate, then decide how
+many to run. `-Level` caps the depth when the automatic level is more than the budget allows.
 
 ### Levels
 
@@ -195,6 +220,9 @@ findings file.
 
 - Treat the output as a list to check, never as a clearance. A review that finds nothing has not shown the change is correct.
 - The finder prompt is new and its recall is not measured.
+- Passes with different lenses can report one defect twice in different words; only reports within three lines of each other are merged.
+- Refute removes findings that code disproves. It cannot judge intent: "this endpoint has no rate limit" stays confirmed whether or not you
+  wanted one.
 - Models that follow the reply format badly lose findings: a reply without a JSON array counts as a failed pass, and the file says so.
 
 ## Development
