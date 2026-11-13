@@ -33,6 +33,9 @@
     ark usage   [-Model <provider/id>]
         Print what is known about the plan limits and the kit's own spend.
 
+    ark allocation [reset]
+        Print what is spent of each provider's allocation (budget.json). `reset` starts a new count from the use now.
+
     ark init    [-Repo <path>] [-Type unity|ts-worker|python|generic] [-Force]
         Write .review-kit/profile.json and profile.md for a repository.
 
@@ -97,6 +100,10 @@ function Invoke-Usage {
             else { 'cursor pool: reported only. It is the pool of the Cursor Agent login; set cursor.applies_to in budget.json to enforce it for another provider once you know they share it.' })
     }
 
+    foreach ($p in @($budget.allocation.Keys | Sort-Object)) {
+        Write-Host "${p}: $(Format-Allocation (Get-AllocationStatus -Provider $p -Budget $budget -Usage (Get-ProviderUsage -Provider $p -Budget $budget) -ReadOnly))"
+    }
+
     $rabbit = Get-RabbitState -Budget $budget
     Write-Host "coderabbit: $($rabbit.Reason)"
     $week = Get-LedgerSpend -Since (Get-Date).AddDays(-7)
@@ -104,6 +111,23 @@ function Invoke-Usage {
     Write-Host ('budget: pause at 5h {0:P0}, stop at week {1:P0}; run caps: usd={2} tokens={3} minutes={4}' -f $budget.five_h_pause, $budget.week_stop,
         ($budget.run.max_usd ?? 'none'), ($budget.run.max_tokens ?? 'none'), ($budget.run.max_minutes ?? 'none'))
     Write-Host "budget file: $(Join-Path (Get-KitHome) 'budget.json')$(if (-not (Test-Path (Join-Path (Get-KitHome) 'budget.json'))) { ' (not present; defaults in use)' })"
+}
+
+function Invoke-Allocation {
+    $budget = Get-Budget
+    $path = Get-AllocationPath
+    if ($Argument -eq 'reset') {
+        if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
+        Write-Host 'allocation: count reset. The next reading of each provider is the new baseline.'
+    }
+    elseif ($Argument) { throw "unknown argument '$Argument'; use 'ark allocation' or 'ark allocation reset'" }
+    $names = @($budget.allocation.Keys | Sort-Object)
+    if (-not $names.Count) { Write-Host 'allocation: none set. Add "allocation" to budget.json, for example { "openai-codex": { "week_points": 30 } }.'; return }
+    foreach ($p in $names) {
+        $a = Get-AllocationStatus -Provider $p -Budget $budget -Usage (Get-ProviderUsage -Provider $p -Budget $budget)
+        Write-Host "${p}: $(Format-Allocation $a)"
+    }
+    Write-Host "role takeover: $(if ($budget.role_takeover) { 'on' } else { 'off' }). State: $path"
 }
 
 function Invoke-Sweep {
@@ -249,6 +273,7 @@ switch ($Command.ToLowerInvariant()) {
     'audit-plan' { Invoke-AuditPlan }
     'audit' { Invoke-AuditRun }
     'usage' { Invoke-Usage }
+    'allocation' { Invoke-Allocation }
     'init' { Invoke-Init }
     'fix' { Invoke-FixPrompt }
     default { Get-Help $PSCommandPath -Full | Out-String | Write-Host }

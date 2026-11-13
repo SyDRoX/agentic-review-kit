@@ -6,5 +6,7 @@
   "self_metered": { "xai": { "five_h_usd": 5.0, "week_usd": 25.0 } },
   "models": { "finder": null, "refute": null, "thinking": null },
   "coderabbit": { "per_hour": 3 },
-  "cursor": { "applies_to": [] }
+  "cursor": { "applies_to": [] },
+  "allocation": {},
+  "role_takeover": false
 }

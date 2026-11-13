@@ -18,6 +18,8 @@ $script:Defaults = @{
     models       = @{ finder = $null; refute = $null; thinking = $null }
     coderabbit   = @{ per_hour = 3 }
     cursor       = @{ applies_to = @() }
+    allocation   = @{}
+    role_takeover = $false
 }
 
 function Get-KitHome {
@@ -59,7 +61,124 @@ function Get-Budget {
     foreach ($k in 'five_h_pause', 'week_stop') {
         if ($b[$k] -le 0 -or $b[$k] -gt 1) { throw "budget $k must be in (0, 1], got $($b[$k])" }
     }
+    foreach ($p in @($b.allocation.Keys)) {
+        $rule = $b.allocation[$p]
+        if ($rule -isnot [hashtable] -or (-not $rule.week_points -and -not $rule.usd)) { throw "budget allocation.$p needs week_points or usd" }
+        if ($rule.week_points -and ($rule.week_points -le 0 -or $rule.week_points -gt 100)) { throw "budget allocation.$p.week_points must be in (0, 100], got $($rule.week_points)" }
+        if ($rule.usd -and $rule.usd -le 0) { throw "budget allocation.$p.usd must be above 0, got $($rule.usd)" }
+    }
     return $b
+}
+
+# Allocation: a share of a provider's allowance that the kit may spend in total, counted from the first gated step.
+# What is spent stays spent through every 5-hour and weekly reset. Only `ark allocation reset` starts a new count.
+
+function Get-AllocationPath { return (Join-Path (Get-KitHome) 'allocation.json') }
+
+function Read-AllocationState {
+    $out = @{}
+    $path = Get-AllocationPath
+    if (Test-Path -LiteralPath $path) {
+        # A state file that cannot be read must stop the run: starting from zero would hand the allocation out again.
+        $j = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -DateKind String
+        foreach ($p in $j.PSObject.Properties) { $out[$p.Name] = $p.Value }
+    }
+    return $out
+}
+
+function Write-AllocationState {
+    param([Parameter(Mandatory)] [hashtable] $State)
+
+    $null = New-Item -ItemType Directory -Force -Path (Get-KitHome)
+    $path = Get-AllocationPath
+    $tmp = "$path.tmp"
+    [System.IO.File]::WriteAllText($tmp, ($State | ConvertTo-Json -Depth 4), [System.Text.UTF8Encoding]::new($false))
+    Move-Item -LiteralPath $tmp -Destination $path -Force
+}
+
+function Step-Allocation {
+    <#
+    .SYNOPSIS
+        The allocation count after one more weekly reading. Pure. Readings are fractions of the weekly allowance.
+        Inside one week the rise since the previous reading is added. After a weekly reset the whole new reading is
+        added, so the count never falls. Use between the last reading and the reset was not seen and is not counted.
+    #>
+    [CmdletBinding()]
+    param($State, [Parameter(Mandatory)] [double] $Week, $WeekReset, [datetime] $Now = (Get-Date))
+
+    $iso = { param($d) if ($d) { ([datetime] $d).ToUniversalTime().ToString('o') } else { $null } }
+    if (-not $State) {
+        return [pscustomobject]@{ kind = 'points'; started = (& $iso $Now); baseline = $Week; last = $Week; reset = (& $iso $WeekReset); consumed = [double] 0; resets = 0 }
+    }
+    $rolled = if ($State.reset -and $WeekReset) { (([datetime] $WeekReset).ToUniversalTime() - ([datetime] $State.reset).ToUniversalTime()).TotalHours -gt 1 }
+    else { $Week -lt [double] $State.last }
+    $add = if ($rolled) { $Week } else { [Math]::Max([double] 0, $Week - [double] $State.last) }
+    return [pscustomobject]@{
+        kind = 'points'; started = $State.started; baseline = $State.baseline; last = $Week
+        reset = $(if ($WeekReset) { & $iso $WeekReset } else { $State.reset })
+        consumed = [Math]::Round([double] $State.consumed + $add, 4); resets = [int] $State.resets + [int] [bool] $rolled
+    }
+}
+
+function Get-AllocationStatus {
+    <#
+    .SYNOPSIS
+        How much of a provider's allocation is spent, or null when the budget sets none. Records the reading unless
+        -ReadOnly. A points allocation needs a reported weekly percentage: without one Known is false.
+    #>
+    [CmdletBinding()]
+    param([string] $Provider, [Parameter(Mandatory)] [hashtable] $Budget, $Usage, [datetime] $Now = (Get-Date), [switch] $ReadOnly)
+
+    if (-not $Provider -or -not $Budget.allocation -or -not $Budget.allocation[$Provider]) { return $null }
+    $rule = $Budget.allocation[$Provider]
+    $all = Read-AllocationState
+    $st = $all[$Provider]
+
+    if ($rule.week_points) {
+        $limit = [double] $rule.week_points / 100
+        if ($st -and $st.kind -ne 'points') { $st = $null }
+        if (-not $Usage -or -not $Usage.Known -or $null -eq $Usage.Week) {
+            return [pscustomobject]@{ Provider = $Provider; Kind = 'points'; Known = $false; Limit = $limit; Consumed = $(if ($st) { [double] $st.consumed } else { $null }); Started = $st.started; Resets = $st.resets }
+        }
+        $st = Step-Allocation -State $st -Week $Usage.Week -WeekReset $Usage.WeekReset -Now $Now
+        if (-not $ReadOnly) { $all[$Provider] = $st; Write-AllocationState $all }
+        return [pscustomobject]@{ Provider = $Provider; Kind = 'points'; Known = $true; Limit = $limit; Consumed = [double] $st.consumed; Started = $st.started; Resets = $st.resets }
+    }
+
+    # A spend allocation is counted from the kit's ledger, which no reset touches.
+    if (-not $st -or $st.kind -ne 'usd') {
+        $st = [pscustomobject]@{ kind = 'usd'; started = $Now.ToUniversalTime().ToString('o') }
+        if (-not $ReadOnly) { $all[$Provider] = $st; Write-AllocationState $all }
+    }
+    $spent = (Get-LedgerSpend -Since ([datetime] $st.started) -Provider $Provider).Usd
+    return [pscustomobject]@{ Provider = $Provider; Kind = 'usd'; Known = $true; Limit = [double] $rule.usd; Consumed = $spent; Started = $st.started; Resets = 0 }
+}
+
+function Format-Allocation {
+    param([Parameter(Mandatory)] $Allocation)
+
+    $since = if ($Allocation.Started) { ' since {0:ddd d MMM HH:mm}' -f ([datetime] $Allocation.Started).ToLocalTime() } else { '' }
+    if ($Allocation.Kind -eq 'usd') { return ('allocation {0:N2} of {1:N2} USD spent{2}' -f $Allocation.Consumed, $Allocation.Limit, $since) }
+    if (-not $Allocation.Known) {
+        $had = if ($null -ne $Allocation.Consumed) { '; last count {0:N1} points' -f ($Allocation.Consumed * 100) } else { '' }
+        return ('allocation of {0:N0} points cannot be measured now: no weekly percentage reported{1}' -f ($Allocation.Limit * 100), $had)
+    }
+    $resets = if ($Allocation.Resets) { ", across $($Allocation.Resets) weekly reset(s)" } else { '' }
+    return ('allocation {0:N1} of {1:N0} points spent{2}{3}' -f ($Allocation.Consumed * 100), ($Allocation.Limit * 100), $since, $resets)
+}
+
+function Sync-Allocation {
+    <#
+    .SYNOPSIS
+        Reads each provider's use once more and records it, so the steps that just ended are counted before a reset can hide them.
+    #>
+    [CmdletBinding()]
+    param([AllowEmptyCollection()] [string[]] $Providers = @(), [Parameter(Mandatory)] [hashtable] $Budget)
+
+    foreach ($p in @($Providers | Where-Object { $_ } | Select-Object -Unique)) {
+        if (-not $Budget.allocation[$p]) { continue }
+        $null = Get-AllocationStatus -Provider $p -Budget $Budget -Usage (Get-ProviderUsage -Provider $p -Budget $Budget)
+    }
 }
 
 function Get-ProviderOf {
@@ -274,7 +393,9 @@ function Get-GateDecision {
         [datetime] $Now = (Get-Date)
     )
 
-    $decide = { param($action, $reason, $until) [pscustomobject]@{ Action = $action; Reason = $reason; WaitUntil = $until } }
+    $al = $Usage.Allocation
+    $alText = if ($al -and $al.Known) { '; ' + (Format-Allocation $al) } else { '' }
+    $decide = { param($action, $reason, $until, $kind) [pscustomobject]@{ Action = $action; Reason = $(if ($action -eq 'go') { $reason + $alText } else { $reason }); WaitUntil = $until; Kind = $kind } }
     $run = $Budget.run
 
     if ($RunSpend) {
@@ -286,6 +407,14 @@ function Get-GateDecision {
     foreach ($q in @($Budget.quiet | Where-Object { $_ })) {
         $a = [datetime] $q[0]; $b = [datetime] $q[1]
         if ($a -le $Now -and $Now -lt $b) { return & $decide 'wait' ('quiet window until {0:ddd HH:mm}' -f $b) $b }
+    }
+
+    if ($al) {
+        # No quota reading at all means the allocation cannot be enforced, so nothing runs. A failed read falls through to the wait below.
+        if (-not $al.Known -and $Usage.Source -eq 'ledger') {
+            return & $decide 'stop' "$($al.Provider): $(Format-Allocation $al). Set a usd allocation, or map the provider to a pool that reports one" $null 'allocation-unknown'
+        }
+        if ($al.Known -and $al.Consumed -ge $al.Limit) { return & $decide 'stop' "$($al.Provider): $(Format-Allocation $al); 'ark allocation reset' starts a new count" $null 'allocation' }
     }
 
     if ($Usage.Known) {
@@ -336,6 +465,7 @@ function Wait-LimitGate {
 
     while ($true) {
         $usage = Get-ProviderUsage -Provider $Provider -Budget $Budget
+        $usage | Add-Member -NotePropertyName Allocation -NotePropertyValue (Get-AllocationStatus -Provider $Provider -Budget $Budget -Usage $usage) -Force
         $spend = if ($Run) { Get-LedgerSpend -Run $Run } else { $null }
         $d = Get-GateDecision -Usage $usage -Budget $Budget -RunSpend $spend -RunStarted $RunStarted
         if ($d.Action -ne 'wait' -or -not $Wait) { return $d }
@@ -370,4 +500,5 @@ function Format-UsageLine {
 
 Export-ModuleMember -Function Get-KitHome, Get-Budget, Get-ProviderOf, Add-LedgerEntry, Get-LedgerSpend, Get-CodexUsage, ConvertFrom-CodexUsage,
     Get-CursorAuthPath, Get-CursorUsage, ConvertFrom-CursorUsage,
-    Get-ProviderUsage, Get-GateDecision, Wait-LimitGate, Format-UsageLine
+    Get-ProviderUsage, Get-GateDecision, Wait-LimitGate, Format-UsageLine,
+    Get-AllocationPath, Step-Allocation, Get-AllocationStatus, Format-Allocation, Sync-Allocation

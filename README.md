@@ -120,7 +120,9 @@ when it disagrees.
   "self_metered": { "xai": { "five_h_usd": 5.0, "week_usd": 25.0 } },
   "models": { "finder": "openai-codex/<model>", "refute": "xai/<model>", "thinking": null },
   "coderabbit": { "per_hour": 3 },
-  "cursor": { "applies_to": [] }
+  "cursor": { "applies_to": [] },
+  "allocation": { "openai-codex": { "week_points": 30 }, "xai": { "usd": 20.0 } },
+  "role_takeover": false
 }
 ```
 
@@ -133,6 +135,8 @@ when it disagrees.
 | `self_metered` | Spend caps, per provider, for providers that report no quota. |
 | `models` | Default finder and refute models, as pi model ids. Unset: pi's default model. |
 | `cursor.applies_to` | Providers whose quota is the Cursor subscription pool, for example `["xai"]`. Empty: the pool is reported, not enforced. |
+| `allocation` | Per provider, the total the kit may spend from the first gated step on: `week_points` (percentage points of the weekly allowance) or `usd` (ledger spend). See below. |
+| `role_takeover` | `true`: when one role's provider has spent its allocation, the other role's model does both roles, inside its own allocation. |
 
 How each provider is read:
 
@@ -151,6 +155,23 @@ not a documented interface and can change with any CLI release; when it fails, t
 The kit never estimates a percentage. A provider without a quota signal is shown as "not reported", with the spend the kit itself recorded.
 That spend is pi's API-equivalent price for the tokens, not a charge; on a subscription it is a relative measure only. A step that ends with
 a usage-limit error from the provider stops the review whatever the ledger says.
+
+### Allocation
+
+`week_stop` is a ceiling on the plan's weekly use. An allocation is a different limit: a fixed amount for the kit, counted from the use at
+the first gated step. With `"week_points": 30` and a plan at 31% then, the kit may add 30 points in total.
+
+- The count is kept in `~/.agentic-review-kit/allocation.json` and only rises. A 5-hour reset pauses a run (`-Wait`, `audit`, `sweep`) and
+  the run goes on after it. A weekly reset does not give the allocation back: use in the new week is added on top.
+- Finder and refute steps of one provider count against the same allocation.
+- `week_points` needs a provider that reports a weekly percentage. The reading is the whole plan's, so your own use of the plan outside the
+  kit counts too. Use between the last reading and a weekly reset is not seen. For a provider that reports no quota, a `week_points` rule
+  stops every run; use `usd`, which is counted from the ledger, or map the provider to a pool with `cursor.applies_to`.
+- A quota read that fails makes the run wait and read again. Nothing runs on an unknown quota, and no other model is tried.
+- A spent allocation stops the run (exit code 3). With `role_takeover`, the other role's model first takes the role over if its own
+  allocation has room; the findings file then notes that finder and refute ran on one model, which loses the cross-model check.
+- `ark allocation` prints the counts. `ark allocation reset` is the only way to start a new count. Raising the number in budget.json
+  raises the limit and keeps the count.
 
 `~/.agentic-review-kit/ledger.jsonl` holds one line per step. Create `~/.agentic-review-kit/STOP` to end a waiting run.
 

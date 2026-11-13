@@ -47,7 +47,8 @@ When the user asks to apply findings: run `<ark> fix "<findings file>"` and foll
 ## Usage
 
 When the user asks about limits or spend: run `<ark> usage` and print its output as it is. A provider that reports no quota is shown as
-"not reported". Never turn that into a percentage.
+"not reported". Never turn that into a percentage. For the allocation alone: `<ark> allocation`. Never run `allocation reset` unless the
+user asks for it in those words.
 
 ## Rules
 

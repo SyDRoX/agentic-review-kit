@@ -285,6 +285,13 @@ function Invoke-Pipeline {
     if ($usePi) {
         $gate = Wait-LimitGate -Provider (Get-ProviderOf $Model) -Budget $Budget -Run $run -RunStarted $RunStarted -Wait:$Wait -Log $Log
         & $Log "budget: $($gate.Action) - $($gate.Reason)"
+        # A spent allocation never comes back by waiting. The other role's model may take this role, inside its own allocation.
+        if ($gate.Kind -eq 'allocation' -and $Budget.role_takeover -and $RefuteModel -and (Get-ProviderOf $RefuteModel) -ne (Get-ProviderOf $Model)) {
+            $Model = $RefuteModel
+            $notes.Add("finder ran on the refute model $Model (takeover: the finder provider's allocation is spent); no cross-model check")
+            $gate = Wait-LimitGate -Provider (Get-ProviderOf $Model) -Budget $Budget -Run $run -RunStarted $RunStarted -Wait:$Wait -Log $Log
+            & $Log "budget: takeover, finder on $Model - $($gate.Action) - $($gate.Reason)"
+        }
         if ($gate.Action -ne 'go') { & $fail 'budget' $gate.Reason; return }
 
         $jobs = @($lv.Lenses | ForEach-Object { @{ Name = "finder-$_"; Prompt = (Format-FinderPrompt -Target $Target -Size $Size -ReviewProfile $ReviewProfile -Level $Lvl -Lens $_ -Mode $Mode) } })
@@ -325,6 +332,11 @@ function Invoke-Pipeline {
     if ($NoRefute) { & $Log (Set-RefuteSkipped -Path $file -Reason '--no-refute') }
     elseif ($merged.Findings.Count) {
         $gate = Wait-LimitGate -Provider (Get-ProviderOf $RefuteModel) -Budget $Budget -Run $run -RunStarted $RunStarted -Wait:$Wait -Log $Log
+        if ($gate.Kind -eq 'allocation' -and $Budget.role_takeover -and $usePi -and $Model -and (Get-ProviderOf $RefuteModel) -ne (Get-ProviderOf $Model)) {
+            $RefuteModel = $Model
+            $gate = Wait-LimitGate -Provider (Get-ProviderOf $RefuteModel) -Budget $Budget -Run $run -RunStarted $RunStarted -Wait:$Wait -Log $Log
+            & $Log "budget: takeover, refute on $RefuteModel (same model as the finder) - $($gate.Action) - $($gate.Reason)"
+        }
         if ($gate.Action -ne 'go') { & $Log (Set-RefuteSkipped -Path $file -Reason "budget: $($gate.Reason)") }
         else {
             $doc = Read-FindingsFile -Path $file
@@ -346,6 +358,7 @@ function Invoke-Pipeline {
         }
     }
 
+    try { Sync-Allocation -Providers @((Get-ProviderOf $Model), (Get-ProviderOf $RefuteModel)) -Budget $Budget } catch { & $Log "allocation: reading after the run failed: $($_.Exception.Message)" }
     & $Log "Findings: $file"
     & $Log ('Spent: {0} tokens, {1:N2} USD (API-equivalent), {2} s' -f $Result.Tokens, $Result.Usd, [int] ((Get-Date) - $started).TotalSeconds)
 }

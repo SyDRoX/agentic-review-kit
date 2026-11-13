@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.0
+
+- `allocation` in budget.json: a per-provider total the kit may spend, in percentage points of the weekly allowance or in ledger USD,
+  counted from the first gated step and kept through 5-hour and weekly resets.
+- `role_takeover`: when one role's provider has spent its allocation, the other role's model does both roles inside its own allocation.
+- `ark allocation` prints the counts; `ark allocation reset` starts a new count.
+- A points allocation on a provider that reports no quota stops the run instead of running unmeasured.
+
 ## 0.3.0
 
 - `ark usage` reports the subscription pool of the Cursor Agent CLI login: percent used, remaining, period length and reset time.

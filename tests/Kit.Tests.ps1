@@ -279,6 +279,138 @@ Describe 'Limits: gate decision' {
         $u = [pscustomobject]@{ Known = $false; Provider = 'openai-codex'; Source = 'provider'; Error = 'usage endpoint: timeout' }
         (Get-GateDecision -Usage $u -Budget $script:Budget -Now $script:Now -RunStarted $script:Now).Action | Should -Be 'wait'
     }
+
+    It 'stops when the allocation is spent, though both windows are free' {
+        $u = New-Usage 0.1 0.2
+        $u | Add-Member Allocation ([pscustomobject]@{ Provider = 'openai-codex'; Kind = 'points'; Known = $true; Limit = 0.30; Consumed = 0.30 })
+        $d = Get-GateDecision -Usage $u -Budget $script:Budget -Now $script:Now -RunStarted $script:Now
+        $d.Action | Should -Be 'stop'
+        $d.Kind | Should -Be 'allocation'
+    }
+
+    It 'goes inside the allocation and names what is spent' {
+        $u = New-Usage 0.1 0.2
+        $u | Add-Member Allocation ([pscustomobject]@{ Provider = 'openai-codex'; Kind = 'points'; Known = $true; Limit = 0.30; Consumed = 0.125 })
+        $d = Get-GateDecision -Usage $u -Budget $script:Budget -Now $script:Now -RunStarted $script:Now
+        $d.Action | Should -Be 'go'
+        $d.Reason | Should -Match '12[.,]5 of 30 points'
+    }
+
+    It 'still waits for the 5-hour reset inside the allocation' {
+        $u = New-Usage 0.9 0.2
+        $u | Add-Member Allocation ([pscustomobject]@{ Provider = 'openai-codex'; Kind = 'points'; Known = $true; Limit = 0.30; Consumed = 0.1 })
+        (Get-GateDecision -Usage $u -Budget $script:Budget -Now $script:Now -RunStarted $script:Now).Action | Should -Be 'wait'
+    }
+
+    It 'stops when a points allocation is set for a provider that reports no quota' {
+        $u = [pscustomobject]@{ Known = $false; Provider = 'xai'; Source = 'ledger'; FiveHUsd = 0.0; WeekUsd = 0.0; FiveHCapUsd = 5.0; WeekCapUsd = 25.0
+            Allocation = [pscustomobject]@{ Provider = 'xai'; Kind = 'points'; Known = $false; Limit = 0.30; Consumed = $null } }
+        $d = Get-GateDecision -Usage $u -Budget $script:Budget -Now $script:Now -RunStarted $script:Now
+        $d.Action | Should -Be 'stop'
+        $d.Kind | Should -Be 'allocation-unknown'
+    }
+
+    It 'waits when the quota read fails under an allocation' {
+        $u = [pscustomobject]@{ Known = $false; Provider = 'openai-codex'; Source = 'provider'; Error = 'timeout'
+            Allocation = [pscustomobject]@{ Provider = 'openai-codex'; Kind = 'points'; Known = $false; Limit = 0.30; Consumed = 0.1 } }
+        (Get-GateDecision -Usage $u -Budget $script:Budget -Now $script:Now -RunStarted $script:Now).Action | Should -Be 'wait'
+    }
+}
+
+Describe 'Limits: allocation' {
+    BeforeEach {
+        $script:Home_ = Join-Path ([IO.Path]::GetTempPath()) ("ark-home-" + [guid]::NewGuid().ToString('N'))
+        $null = New-Item -ItemType Directory $script:Home_
+        $env:ARK_HOME = $script:Home_
+        $script:T = [datetime] '2026-11-13T12:00:00'
+        $script:Reset = $script:T.AddDays(3)
+    }
+    AfterEach { Remove-Item Env:ARK_HOME; Remove-Item $script:Home_ -Recurse -Force -ErrorAction SilentlyContinue }
+
+    It 'starts at zero from the first reading, whatever the use already is' {
+        $s = Step-Allocation -State $null -Week 0.31 -WeekReset $script:Reset -Now $script:T
+        $s.consumed | Should -Be 0
+        $s.baseline | Should -Be 0.31
+    }
+
+    It 'adds the rise inside one week' {
+        $s = Step-Allocation -State $null -Week 0.31 -WeekReset $script:Reset -Now $script:T
+        $s = Step-Allocation -State $s -Week 0.36 -WeekReset $script:Reset
+        $s = Step-Allocation -State $s -Week 0.40 -WeekReset $script:Reset
+        $s.consumed | Should -Be 0.09
+        $s.resets | Should -Be 0
+    }
+
+    It 'keeps what was spent through a weekly reset and adds the new week on top' {
+        $s = Step-Allocation -State $null -Week 0.31 -WeekReset $script:Reset -Now $script:T
+        $s = Step-Allocation -State $s -Week 0.45 -WeekReset $script:Reset
+        $s = Step-Allocation -State $s -Week 0.03 -WeekReset $script:Reset.AddDays(7)
+        $s.consumed | Should -Be 0.17
+        $s.resets | Should -Be 1
+        $s = Step-Allocation -State $s -Week 0.05 -WeekReset $script:Reset.AddDays(7)
+        $s.consumed | Should -Be 0.19
+    }
+
+    It 'counts a reset even when the new reading is above the old one' {
+        $s = Step-Allocation -State $null -Week 0.10 -WeekReset $script:Reset -Now $script:T
+        $s = Step-Allocation -State $s -Week 0.12 -WeekReset $script:Reset.AddDays(7)
+        $s.consumed | Should -Be 0.12
+    }
+
+    It 'never lowers the count when a reading dips inside one week' {
+        $s = Step-Allocation -State $null -Week 0.31 -WeekReset $script:Reset -Now $script:T
+        $s = Step-Allocation -State $s -Week 0.40 -WeekReset $script:Reset
+        $s = Step-Allocation -State $s -Week 0.38 -WeekReset $script:Reset
+        $s.consumed | Should -Be 0.09
+    }
+
+    It 'takes a falling reading as a reset when no reset time is reported' {
+        $s = Step-Allocation -State $null -Week 0.50 -Now $script:T
+        $s = Step-Allocation -State $s -Week 0.60
+        $s = Step-Allocation -State $s -Week 0.02
+        $s.consumed | Should -Be 0.12
+    }
+
+    It 'persists the count between calls and returns null without a rule' {
+        $b = @{ allocation = @{ 'openai-codex' = @{ week_points = 30 } } }
+        $u = { param($w) [pscustomobject]@{ Known = $true; Week = $w; WeekReset = $script:Reset } }
+        (Get-AllocationStatus -Provider 'openai-codex' -Budget $b -Usage (& $u 0.31)).Consumed | Should -Be 0
+        $a = Get-AllocationStatus -Provider 'openai-codex' -Budget $b -Usage (& $u 0.37)
+        $a.Consumed | Should -Be 0.06
+        $a.Limit | Should -Be 0.30
+        (Get-AllocationStatus -Provider 'openai-codex' -Budget $b -Usage (& $u 0.50) -ReadOnly).Consumed | Should -Be 0.19
+        (Get-AllocationStatus -Provider 'openai-codex' -Budget $b -Usage (& $u 0.37)).Consumed | Should -Be 0.06
+        Get-AllocationStatus -Provider 'xai' -Budget $b -Usage (& $u 0.1) | Should -BeNullOrEmpty
+    }
+
+    It 'reports a points allocation as unknown without a reading, keeping the last count' {
+        $b = @{ allocation = @{ 'openai-codex' = @{ week_points = 30 } } }
+        $null = Get-AllocationStatus -Provider 'openai-codex' -Budget $b -Usage ([pscustomobject]@{ Known = $true; Week = 0.2; WeekReset = $script:Reset })
+        $null = Get-AllocationStatus -Provider 'openai-codex' -Budget $b -Usage ([pscustomobject]@{ Known = $true; Week = 0.25; WeekReset = $script:Reset })
+        $a = Get-AllocationStatus -Provider 'openai-codex' -Budget $b -Usage ([pscustomobject]@{ Known = $false; Error = 'x' })
+        $a.Known | Should -BeFalse
+        $a.Consumed | Should -Be 0.05
+    }
+
+    It 'counts a spend allocation from the ledger, both roles of the provider' {
+        $b = @{ allocation = @{ xai = @{ usd = 2.0 } } }
+        (Get-AllocationStatus -Provider 'xai' -Budget $b -Usage $null).Consumed | Should -Be 0
+        Add-LedgerEntry -Step 'finder-correctness' -Provider 'xai' -Tokens 10 -Usd 0.5
+        Add-LedgerEntry -Step 'refute-F1' -Provider 'xai' -Tokens 10 -Usd 0.25
+        Add-LedgerEntry -Step 'finder-correctness' -Provider 'openai-codex' -Tokens 10 -Usd 9
+        $a = Get-AllocationStatus -Provider 'xai' -Budget $b -Usage $null
+        $a.Consumed | Should -Be 0.75
+        $a.Known | Should -BeTrue
+    }
+
+    It 'rejects an allocation rule without an amount' {
+        Set-Content (Join-Path $script:Home_ 'budget.json') '{ "allocation": { "xai": { } } }'
+        { Get-Budget } | Should -Throw '*week_points or usd*'
+        Set-Content (Join-Path $script:Home_ 'budget.json') '{ "allocation": { "xai": { "week_points": 30 } }, "role_takeover": true }'
+        $b = Get-Budget
+        $b.allocation.xai.week_points | Should -Be 30
+        $b.role_takeover | Should -BeTrue
+    }
 }
 
 Describe 'Limits: budget file, ledger and Codex reply' {
